@@ -3,20 +3,31 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog/log"
 	"net/http"
 	"text/template"
-
-	"github.com/gin-gonic/gin"
-	"github.com/gorilla/websocket"
 )
 
 var users map[string]User
 
+var redisCli *redis.Client
+
 func init() {
 	users = make(map[string]User)
+
+	redisCli = redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "", // no password set
+		DB:       0,  // use default DB
+	})
+	res := redisCli.Ping(context.Background())
+	if res.Err() != nil {
+		panic(res.Err())
+	}
 }
 
 var upgrader = websocket.Upgrader{} // use default option
@@ -53,6 +64,23 @@ type AuthRequest struct {
 	Name string `json:"name"`
 }
 
+func getUser(sessionId string) User {
+	res := redisCli.HGet(context.Background(), fmt.Sprintf("users.%v", sessionId), "name")
+	return User{
+		SessionID: sessionId,
+		Name:      res.Val(),
+	}
+}
+
+func authMiddleware(c *gin.Context) {
+	session_id := c.GetHeader("session_id")
+	user := getUser(session_id)
+	if user.Name == "" {
+		c.AbortWithStatus(http.StatusForbidden)
+		return
+	}
+}
+
 func auth(c *gin.Context) {
 	var r AuthRequest
 	err := c.BindJSON(&r)
@@ -70,6 +98,11 @@ func auth(c *gin.Context) {
 		SessionID: string(msg),
 	}
 	log.Info().Interface("users", users).Msg("added new user")
+
+	res := redisCli.HSet(context.Background(), fmt.Sprintf("users.%v", string(msg)), "name", r.Name, "session_id", string(msg))
+	if res.Err() != nil {
+		panic(err)
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"session_id": string(msg),
@@ -101,12 +134,18 @@ func ExampleClient() {
 	fmt.Println("key", val)
 }
 
+func test2(c *gin.Context) {
+	sessionId := c.Param("session")
+	c.JSON(200, getUser(sessionId))
+}
+
 func main() {
 
 	ExampleClient()
 
 	r := gin.Default()
 	r.GET("/echo", echo)
+	r.GET("/test2/:session", authMiddleware, test2)
 	r.GET("/", home)
 	r.POST("/api/auth", auth)
 
